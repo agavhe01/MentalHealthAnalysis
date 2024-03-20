@@ -1,0 +1,504 @@
+---
+title: "Finale"
+output: html_document
+date: "2023-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Loading Libs and File
+
+
+library(haven)
+library(dplyr)
+library(magrittr)
+library(car)
+library(leaps)
+library(randomForest)
+library(ggplot2)
+library(caret)
+library(MASS)
+library(glmnet)
+
+
+
+
+nyc_whole <- read_sas("./chs2020_public.sas7bdat")
+head(nyc_whole)
+
+```
+
+```{r}
+
+# List of MetaData columns to drop, and the mood 1-6 because they are directly related to the k6 value
+meta_columns_to_drop <- c("cid", "wt_compare" ,"strata", "survey", "wt21_dual", "wt21_dual_q1", "strata_q1", "qxvers", "mood1","mood2","mood3","mood4", "mood5", "mood6")
+
+# Identify indices of columns to drop
+columns_to_drop <- which(names(nyc_whole) %in% meta_columns_to_drop)
+
+# Drop the specified columns
+nyc_sub <- nyc_whole[, -columns_to_drop]
+# head(nyc_sub)
+
+# UNDERSTANDING MISSING VALUES
+
+# Identify columns with missing values and calculate percentages of missing values per col
+missing_values <- colSums(is.na(nyc_sub))
+missing_percentage <- (missing_values / nrow(nyc_sub)) * 100
+missing_df <- data.frame(Column = names(missing_percentage), Percentage = missing_percentage)
+print(missing_df)
+
+```
+
+```{r}
+# Dropping columns with more thaN 5% missing values
+
+# Drop rows where Percentage is less than 5%
+missing_5_df <- missing_df[missing_df$Percentage >= 5, ]
+
+# Create an array rows where Percentage is less than 5% and drop these rows
+missing_5_arr<- unique(missing_5_df$Column)
+#nyc_clean <- nyc_sub %>% select(-one_of(missing_5_arr))
+
+# Identify indices of columns to drop
+columns_to_drop <- which(names(nyc_sub) %in% missing_5_arr)
+
+# Drop the specified columns
+nyc_clean <- nyc_sub[, -columns_to_drop]
+names(nyc_clean)
+
+# TEST: Recalculate missing percentages of clean df. 
+#       Should be all less than 5%
+#
+missing_values_ <- colSums(is.na(nyc_clean))
+missing_percentage_ <- (missing_values_ / nrow(nyc_clean)) * 100
+missing_df_ <- data.frame(Column = names(missing_percentage_), Percentage = missing_percentage_)
+print(missing_df_)
+```
+
+```{r}
+# Data Imputation: Imputing mean, mode 
+
+# Mode function definition
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Continuus columns that need median imputance for missing values. Maybe mode rather?
+cont_cols <- c("numadults2", "bmi", "nsugardrinkperday20",  "nsodasugarperday20", "nutrition1", "daysalc30", "averagedrink20")# ,"hhsize")
+
+# Identify columns with missing values
+missing_values <- colSums(is.na(nyc_clean))
+columns_with_missing <- names(missing_values[missing_values > 0])
+
+for (col in columns_with_missing) {
+  print(col)
+  
+  if (col %in% cont_cols) {
+    # For continuous columns, impute with median
+    median_value <- median(nyc_clean[[col]], na.rm = TRUE)
+    nyc_clean[[col]][is.na(nyc_clean[[col]])] <- median_value
+  } else {
+    # For other columns, impute with mode
+    mode_value <- Mode(nyc_clean[[col]])
+    nyc_clean[[col]][is.na(nyc_clean[[col]])] <- mode_value
+  }
+}
+
+# TEST: Recalculate missing percentages of clean df. 
+#       Should be all 0%
+#
+missing_values__ <- colSums(is.na(nyc_clean))
+missing_percentage__ <- (missing_values__ / nrow(nyc_clean)) * 100
+missing_df__ <- data.frame(Column = names(missing_percentage__), Percentage = missing_percentage__)
+print(missing_df__)
+
+# Create a new column k6categorical to classify k6  by range of values
+nyc_clean$k6categorical <- cut(nyc_clean$k6,
+                               breaks = c(-Inf, 4, 9, 14, 19, Inf),
+                               labels = c(1, 2, 3, 4, 5),
+                               include.lowest = TRUE)
+
+# Convert the new column to numeric
+nyc_clean$k6categorical <- as.numeric(nyc_clean$k6categorical)
+#print(nyc_clean$k6categorical)
+
+
+# Voila! Our Dataframe with no missing values, ready to begin our ML analysis
+head(nyc_clean)
+
+```
+
+```{r}
+
+# DATA SPLIT - 80 20 RATIO
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Assuming nyc_filtered is your data frame
+# Create an index for splitting the data
+index <- sample(seq_len(nrow(nyc_clean)), size = 0.8 * nrow(nyc_clean))
+
+# Split the data into training and testing sets
+nyc_train <- nyc_clean[index, ]
+nyc_test <- nyc_clean[-index, ]
+
+# Should be 80:20 
+print(nrow(nyc_train))
+print(nrow(nyc_test))
+
+
+
+```
+
+```{r}
+
+# Backward Selection
+
+# Fit a linear model with forward selection
+model <- lm(nyc_train$k6 ~ ., data = nyc_train[, !names(nyc_train) %in% c("k6categorical")])
+backward_model <- stepAIC(model, direction = "backward")
+
+# Print summary of the model
+#summary(backward_model)
+
+# Extract the coefficient table from the summary
+coefficients <- summary(backward_model)$coefficients
+
+#print(coefficients)
+
+# Drop rows with p-value less than 0.05
+significant_coefficients_backward <- coefficients[coefficients[, "Pr(>|t|)"] < 0.05, ]
+
+# Print or use the updated coefficients table as needed
+print(significant_coefficients_backward) # !!!!!!!! these are the columns that accept as the results of our backward selection !!!!!!!!!!!
+
+```
+
+```{r}
+# Exctracting only the significant columns from the backward selection
+
+num_columns <- ncol(head(nyc_clean))
+print(num_columns)
+
+num_columnsw <- ncol(head(nyc_whole))
+print(num_columnsw)
+
+# Assuming significant_coefficients_backward is a data frame
+# Extract column names from row names
+selected_columns <- rownames(significant_coefficients_backward)
+selected_columns <- selected_columns[-1] # dropping "Intercept" because it does not exist as one of our cols
+selected_columns <- c(selected_columns, "k6categorical")
+
+# Print or use the updated coefficients table as needed
+print(significant_coefficients_backward) # !!!!!!!! these are the columns that accept as the results of our backward selection !!!!!!!!!!!
+
+# Subset df_clean using the selected columns
+nyc_filtered <- nyc_clean[, selected_columns]
+
+#print(names(nyc_filtered))
+
+# Redine the train and test set to be from nyc_filtered (only cols from backwaard)
+nyc_train <- nyc_filtered[index, ]
+nyc_test <- nyc_filtered[-index, ]
+
+# Separate predictors (x) and target variable (y)
+x_train <- nyc_train[, !names(nyc_train) %in% c("k6categorical")]
+y_train <- as.factor(nyc_train$k6categorical)
+
+x_test <- nyc_test[, !names(nyc_test) %in% c("k6categorical")]
+y_test <- as.factor(nyc_test$k6categorical)
+
+
+print(nrow(x_train))
+print(length(y_train))
+print(nrow(x_test))
+print(length(y_test))
+
+print(levels(y_train))
+print(levels(y_test))
+```
+
+```{r}
+
+
+# 1. MULTIPLE LOGISTIC REGRESISON
+
+library(caret)
+
+# Optimization approach
+
+# # Create a hyperparameter grid
+ hyper_grid <- expand.grid(
+   alpha = c(0, 0.5, 1),  # Vary alpha (0, 0.5, 1 for L1, elastic net, L2 regularization)
+   lambda = c(0.001, 0.01, 0.1)  # Vary lambda
+ )
+# 
+# # Define control parameters for caret
+ctrl <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+# 
+# # Combine predictors and target for training data
+train_data <- cbind(x_train, k6categorical = y_train) 
+
+train_data$k6categorical <- as.factor(train_data$k6categorical)
+
+ lr_model_2 <- train(
+   k6categorical ~ .,
+   data = train_data,
+   method = "glmnet",
+   tuneGrid = hyper_grid,
+   trControl = ctrl,
+   family = "multinomial"
+ )
+ 
+# # Print the best hyperparameters
+print(lr_model_2$bestTune) # alpha = 1, lambda = 0.001
+
+# # Make predictions on test data and Calculate accuracy on test data
+lr_2_predictions_test <- predict(lr_model_2, newdata = x_test)
+lr_2_accuracy_test <- sum(lr_2_predictions_test == y_test) / length(y_test)
+
+# # Print the accuracy on test data
+print(paste("Test Accuracy:", lr_2_accuracy_test)) # "Test Accuracy: 0.653386454183267" 
+
+```
+
+```{r}
+
+# 2. SIMPLE VECTOR MACHINES
+# linear Kernel
+
+library(e1071)
+
+# Assuming you have your data split into x_train, x_test, y_train, and y_test
+
+# Scale the features
+scaled_X_train <- scale(x_train)
+scaled_X_test <- scale(x_test)
+
+C_values <- c(0.01, 0.1, 1, 10)  # Different values for the 'C' parameter
+mse_values <- vector('numeric', length = length(C_values))
+
+svm_best_model <- NULL
+svm_best_accuracy <- 0
+
+for (i in seq_along(C_values)) {
+  # Train the linear SVM model for each 'C' value
+  svm_model <- svm(K6 ~ ., data = data.frame(scaled_X_train, K6 = as.factor(y_train                    )), kernel = "linear", cost = C_values[i])
+  # Make predictions on the test set
+  svm_predictions <- predict(svm_model, newdata = scaled_X_test)
+  
+  svm_accuracy <- mean(svm_predictions == y_test)
+  
+  # print(svm_accuracy)
+  
+  if (svm_accuracy > svm_best_accuracy){
+    svm_best_accuracy <- svm_accuracy
+    svm_best_model <- svm_model
+  }
+}
+print(paste("Accuracy:", svm_best_accuracy)) # 0.64314171883893
+
+
+# Selecting the best model with optimized hyperparams
+
+# Predict on the test set
+svm_best_predictions <- predict(svm_best_model, newdata = scaled_X_test)
+
+# Evaluate the classification model
+svm_best_accuracy <- mean(svm_best_predictions == y_test)
+print(paste("Accuracy:", svm_best_accuracy))
+
+```
+
+```{r}
+
+# 3. K NEARNEST NEIGHBOURS CLUSTERING
+
+# Load required library
+library(class)
+
+# Set up a grid of parameters for tuning
+knn_k_values <- seq(1, 10, by = 1)  # You can adjust the range of k values
+
+# Initialize variables to store results
+knn_best_k <- NULL
+knn_best_accuracy <- 0
+
+# Iterate through k values
+for (k in knn_k_values) {
+  # Train the KNN model
+  knn_model <- knn(train = x_train, test = x_test, cl = y_train, k = k)
+  
+  # Evaluate accuracy on testing data
+  knn_accuracy <- sum(knn_model == y_test) / length(y_test)
+  
+  # Update best model if the current model is better
+  if (knn_accuracy > knn_best_accuracy) {
+    knn_best_accuracy <- knn_accuracy
+    knn_best_k <- k
+  }
+}
+
+# Train the best KNN model with the optimal k
+best_knn_model <- knn(train = x_train, test = x_test, cl = y_train, k = knn_best_k)
+
+# Print the best k value and accuracy
+cat("Best k value:", knn_best_k, "\n") # k = 7
+cat("Best Accuracy:", knn_best_accuracy, "\n")
+
+# Use the best model to predict on new data
+knn_predicted_labels <- best_knn_model # Best Accuracy: 0.6027319 
+
+# (Optional) Print or analyze the predicted labels
+# print(knn_predicted_labels)
+```
+
+```{r}
+
+library(randomForest)
+
+# Function to perform grid search for random forest
+tuneRandomForest <- function(x_train, y_train, x_test, y_test, ntree_vals, mtry_vals) {
+  rf_best_accuracy <- 0
+  rf_best_model <- NULL
+  rf_best_ntree <- NULL
+  rf_best_mtry <- NULL
+  rf_best_maxD <- 0
+  rf_best_pred <- NULL
+  
+for (maxD in maxdepth_values ){
+  for (ntree in ntree_vals) {
+    for (mtry in mtry_vals) {
+      # Train the random forest model
+      rf_model <- randomForest(x = x_train, y = y_train, ntree = ntree, mtry = mtry, maxdepth = maxD)
+      
+      # Make predictions on the test set
+      rf_predictions <- predict(rf_model, newdata = x_test)
+      
+      # Calculate accuracy
+      rf_accuracy <- sum(rf_predictions == y_test) / length(y_test)
+      
+      # Update best model if current accuracy is higher
+      if (rf_accuracy > rf_best_accuracy) {
+        rf_best_accuracy <- rf_accuracy
+        rf_best_model <- rf_model
+        rf_best_ntree <- ntree
+        rf_best_mtry <- mtry
+        rf_best_maxD <- maxD
+        rf_best_pred <-rf_predictions
+      }
+    }
+  }
+}
+  
+  # Return the best model and its hyperparameters
+  return(list(best_model =  rf_best_model, best_accuracy = rf_best_accuracy, 
+              best_ntree = rf_best_ntree, best_mtry = rf_best_mtry, best_maxDepth =  rf_best_maxD, best_pred = rf_best_pred ))
+}
+
+# Specify the values to search over for ntree and mtry
+# Ran for several hyperparams (~ 2hrs runtime), only listing the optimum set we found to save time 
+ntree_values <- c(200) 
+mtry_values <- c(4) 
+maxdepth_values = c(5)
+
+# Perform grid search
+rf_result <- tuneRandomForest(x_train, y_train, x_test, y_test, ntree_values, mtry_values)
+
+# Print the results
+cat("Best Accuracy:", rf_result$best_accuracy, "\n")
+cat("Best ntree:", rf_result$best_ntree, "\n")
+cat("Best mtry:", rf_result$best_mtry, "\n")
+cat("Best mtry:", rf_result$best_mtry, "\n")
+cat("Best maxDepth:", rf_result$best_maxDepth, "\n")
+
+
+print(rf_best_model)
+
+print(rf_result$best_model)
+
+
+```
+
+
+
+```{r}
+# Visual Summary of our ML
+
+# Sample data (replace these with your actual model names and accuracy values)
+model_names <- c("Multiple Lin-Reg", "KNN", "RandomForests", "SVM")
+accuracy_values <- c(0.6579, 0.5788, 0.6666, 0.6425)
+
+# Create a data frame
+data <- data.frame(Model = model_names, Accuracy = accuracy_values)
+
+# Plotting
+bar_colors <- c("skyblue", "lightgreen", "coral", "lightpink")  # Customize colors as needed
+
+# Create the bar plot
+barplot(data$Accuracy, names.arg = data$Model, col = bar_colors, ylim = c(0, 1),
+        main = "Model Accuracy Comparison", xlab = "Model Names", ylab = "Accuracy")
+
+# Display the accuracy values on top of the bars
+text(x = barplot(data$Accuracy, names.arg = data$Model, col = bar_colors, ylim = c(0, 1),
+        main = "Model Accuracy Comparison", xlab = "Model Names", ylab = "Accuracy"),
+        y = data$Accuracy + 0.02, labels = round(data$Accuracy, 2), pos = 3, cex = 0.8, col = "black")
+
+# Add a legend
+legend("topright", legend = model_names, fill = bar_colors, title = "Models")
+
+# Adjust the plot layout
+par(mar = c(6, 4, 4, 2) + 0.1)
+
+# Display the accuracy values on top of the bars
+text(
+  x = barplot(data$Accuracy, names.arg = data$Model, col = bar_colors, ylim = c(0, 1),
+              main = "Model Accuracy Comparison", xlab = "Model Names", ylab = "Accuracy"),
+  y = data$Accuracy + 0.02,
+  labels = round(data$Accuracy, 2),
+  pos = 3,  # Position the text above the bars
+  cex = 0.8,  # Text size
+  col = "black"  # Text color
+)
+
+
+# Show the plot
+dev.off()  # This line is needed to display the plot in some R environments
+
+```
+
+
+```{r}
+
+# Random Forest Feature Importance
+
+
+
+
+# Extract feature importance and convert it to a data frame
+feature_importance <- as.data.frame(importance(rf_result$best_model))
+
+# Plot feature importance
+# Extract feature importance and convert it to a data frame
+feature_importance <- as.data.frame(importance(rf_result$best_model))
+
+# Plot feature importance
+ggplot(data = feature_importance, aes(x = row.names(feature_importance), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "blue", width = 0.7) +
+  labs(title = "Random Forest Feature Importance",
+       x = "Feature",
+       y = "Mean Decrease in Gini Index") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+
+
+```
